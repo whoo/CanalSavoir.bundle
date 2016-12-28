@@ -1,0 +1,55 @@
+import video as Video
+
+RE_THUMB = Regex("image: *'([^']+)")
+RE_VIDEO = Regex("file: *'([^']+)")
+RE_VID_ID = Regex('/(v|e(mbed)?)/(v/)?(?P<id>.{11})')
+BASE = "http://www.canalsavoir.tv"
+
+REURL= Regex('(.ttp:.*)"')
+
+####################################################################################################
+def MetadataObjectForURL(url):
+	Log.Debug("[31m CS Metadata Info "+url+"[00m")
+	page = HTML.ElementFromURL(url,errors='ignore')
+	url=page.xpath("//iframe")[0].get('src')
+	if (str(url[2:17])=="www.youtube.com"):
+		url="http:"+url
+	title="video"
+	if (len(page.xpath("//meta[@property='og:title']"))>0):
+		title=page.xpath("//meta[@property='og:title']")[0].get("content")
+
+	info=""
+	info=page.xpath("//meta[@property='og:description']")[0].get("content")
+	thumb=page.xpath("//meta[@property='og:image']")[0].get("content")
+
+
+	return VideoClipObject(title=title,summary=info,thumb=thumb)
+
+####################################################################################################
+def MediaObjectsForURL(url):
+	Log.Debug("CS Info before Play "+url)
+
+	return [MediaObject(
+			video_codec = VideoCodec.H264,
+			audio_codec = AudioCodec.AAC,
+			container = 'mp4',
+			parts = [ PartObject(key=Callback(PlayVideo, url = url,  res = 'hd'))]
+			)]
+
+
+
+def PlayVideo(url, res):
+	Log.Debug("[32m Play Video : "+url+"[00m")
+	page = HTML.ElementFromURL(url,errors='ignore')
+	url=page.xpath("//iframe")[0].get('src')
+	if (str(url[2:17])=="www.youtube.com"):
+		url="http:"+url
+		info = Video.GetVideoUrls(url)
+		url=info[22]
+	else:
+		page = HTML.ElementFromURL(BASE+url,errors='ignore')
+		src=page.xpath("//script[contains(.,'src')]/text()")[0]
+		url= REURL.findall(src)[0]
+	Log.Debug(url)
+        return Redirect(url)
+

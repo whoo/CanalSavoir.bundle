@@ -1,0 +1,370 @@
+# -*- coding: utf-8 -*-
+
+# Copyright (c) 2014, KOL
+# All rights reserved.
+
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are met:
+#     * Redistributions of source code must retain the above copyright
+#       notice, this list of conditions and the following disclaimer.
+#     * Redistributions in binary form must reproduce the above copyright
+#       notice, this list of conditions and the following disclaimer in the
+#       documentation and/or other materials provided with the distribution.
+#     * Neither the name of the <organization> nor the
+#       names of its contributors may be used to endorse or promote products
+#       derived from this software without specific prior written permission.
+
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+# WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTLICULAR PURPOSE ARE
+# DISCLAIMED. IN NO EVENT SHALL <COPYRIGHT HOLDER> BE LIABLE FOR ANY
+# DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+# (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+# LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+# ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+# SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+from datetime import timedelta
+from jsinterp import JSInterpreter
+
+DEFINITIONS = {
+    'sd': (36, 18),
+    'hd': (22, 18, 36),
+}
+
+RESOLUTIONS = {
+    22: 720,
+    18: 360,
+    36: 240,
+    160: 144,
+    133: 240,
+    134: 360,
+    135: 480,
+    136: 720,
+    298: 720.60,
+    137: 1080,
+    299: 1080.60,
+}
+
+AUDIO = {
+    141: 256,
+    140: 128,
+    139: 48,
+}
+
+MAX_RESOLUTION = 22
+
+USER_AGENT = (
+    'Mozilla/5.0 (iPad; CPU OS 7_0_4 like Mac OS X) '
+    'AppleWebKit/537.51.1 (KHTML, like Gecko) Version/7.0 '
+    'Mobile/11B554a Safari/9537.54'
+)
+
+RE_DATA = Regex('ytplayer.config\s*=\s*({(?:.+)});\s*ytplayer.load\s*=')
+
+
+def GetServiceURL(vid, token='', hl=''):
+    return 'http://tv.youtube.plugins.plex.com/%s%s%s%s%s' % (
+        vid,
+        '&access_token=' if token else '',
+        token,
+        '&hl=' if hl else '',
+        hl
+    )
+
+
+def GetMetaUrlByServiceURL(url):
+    return 'https://www.youtube.com/watch?v=%s' % GetOID(url)
+
+
+def GetVideoData(url):
+    try:
+        res = HTML.ElementFromURL(GetMetaUrlByServiceURL(url))
+    except:
+        raise Ex.MediaNotAvailable
+
+    ret = {}
+
+    try:
+        ret = JSON.ObjectFromString(RE_DATA.search(
+            res.xpath(
+                '//script[contains(., "ytplayer.config")]'
+            )[0].text_content()
+        ).group(1))
+    except Exception as e:
+        Log.Error('Cannot get video data: %s' % e)
+        raise Ex.MediaNotAvailable
+
+    try:
+        cont = res.xpath('//div[@id="watch7-container"]')[0]
+        ret['date_published'] = cont.xpath(
+            '//meta[@itemprop="datePublished"]'
+        )[0].get('content')
+        cont = cont.xpath(
+            '//div[@id="watch-description-text"]'
+        )[0]
+        for br in cont.xpath('*//br'):
+            br.tail = '\n' + br.tail if br.tail else '\n'
+        ret['description'] = cont.text_content()
+    except:
+        pass
+
+    return ret
+
+
+def GetOID(url):
+    return url[url.rfind('/')+1:]
+
+
+def MetaFromInfo(item):
+    try:
+        return item['args']
+    except:
+        return None
+
+
+def GetFeedVid(item):
+    if 'video_id' in item:
+        return item['video_id']
+    if 'encrypted_id' in item:
+        return item['encrypted_id']
+    if item['item_type'] == 'shelf':
+        return item['content']['items'][0]['encrypted_id']
+
+    return None
+
+
+def GetVideoUrls(url):
+    info = GetVideoData(url)
+    meta = MetaFromInfo(info)
+    try:
+        player_url = info['assets']['js']
+    except:
+        player_url = None
+
+    ret = {}
+    # Live stream
+    if 'hlsvp' in meta and meta['hlsvp']:
+        Log.Debug('Parse playlist')
+
+        try:
+            res = HTTP.Request(meta['hlsvp']).content.splitlines()
+        except:
+            res = None
+
+        if res:
+            fmt_re = Regex('^#EXT-X-STREAM-INF.+,RESOLUTION=[0-9]+x([0-9]+),')
+            index = range(len(res))
+            res_map = dict(map(reversed, RESOLUTIONS.items()))
+
+            for i in index:
+                match = fmt_re.search(res[i])
+                if match:
+                    resolution = int(match.group(1))
+                    i = i+1
+                    if resolution in res_map:
+                        ret[res_map[resolution]] = res[i]
+                    # Next line does need to processing
+                    index.remove(i)
+
+    # Normal video
+    elif 'url_encoded_fmt_stream_map' in meta:
+        # High definition
+        key = 'url_encoded_fmt_stream_map'
+        if 'adaptive_fmts' and IsAdaptiveSupport():
+            key = 'adaptive_fmts'
+
+        for item in meta[key].split(','):
+            item = dict(map(
+                lambda x: (x[0], x[1][0]),
+                String.ParseQueryString(item).items()
+            ))
+            itag = int(item['itag'])
+            if itag in RESOLUTIONS or itag in AUDIO:
+                ret[itag] = GetUrlFromStream(item, player_url)
+
+    if not len(ret):
+        raise Ex.MediaNotAvailable
+
+    return ret
+
+
+def ParseLinksFromDescription(text):
+    re = Regex(
+        (
+            r'^(.+)[\s\n]*(https?://(?:www\.|m\.)?youtu(?:be\.com|\.be)/'
+            '(?!account(?:_|\?)?|artist(?:/|\?)|blog\?|categories\?|'
+            'channels\?|charts|embed/(?:__videoid__|videoseries\?)|p/|'
+            'profile\?|results\?|subscribe_widget|\?tab=).+)'
+        ),
+        Regex.MULTILINE
+    )
+    return re.findall(text)
+
+
+def GetUrlFromStream(item, player_url):
+    ret = item['url']
+    if player_url and 's' in item:
+        ret = '%s&signature=%s' % (ret, DecryptSignature(item['s'], player_url))
+
+    return ret
+
+
+def IsAdaptiveSupport():
+    return False
+
+
+def DecryptSignature(s, player_url):
+    """Turn the encrypted s field into a working signature"""
+
+    try:  # hasattr workaround
+        len(DecryptSignature.cache)
+    except:
+        DecryptSignature.cache = {}
+
+    def signature_cache_id(example_sig):
+        return '.'.join(str(len(part)) for part in example_sig.split('.'))
+
+    def parse_sig_js(jscode):
+        funcname = Regex('\.sig\|\|([a-zA-Z0-9$]+)\(').search(jscode).group(1)
+        jsi = JSInterpreter(jscode)
+        initial_function = jsi.extract_function(funcname)
+        return lambda s: initial_function([s])
+
+    if player_url.startswith('//'):
+        player_url = 'https:' + player_url
+    try:
+        player_id = (player_url, signature_cache_id(s))
+        if player_id not in DecryptSignature.cache:
+            code = HTTP.Request(player_url).content
+            DecryptSignature.cache[player_id] = parse_sig_js(code)
+
+        return DecryptSignature.cache[player_id](s)
+    except Exception as e:
+        Log.Error('Cannot decrypt signature: %s' % e)
+        return ''
+
+
+def ParseDuration(durationstr):
+    '''
+    Original on https://bitbucket.org/nielsenb/aniso8601
+    '''
+
+    def parse_duration_element(durationstr, elementstr):
+        #Extracts the specified portion of a duration, for instance, given:
+        #durationstr = 'T4H5M6.1234S'
+        #elementstr = 'H'
+        #
+        #returns 4
+        #
+        #Note that the string must start with a character, so its assumed the
+        #full duration string would be split at the 'T'
+
+        durationstartindex = 0
+        durationendindex = durationstr.find(elementstr)
+
+        for characterindex in xrange(durationendindex - 1, 0, -1):
+            if durationstr[characterindex].isalpha() == True:
+                durationstartindex = characterindex
+                break
+
+        durationstartindex += 1
+
+        if ',' in durationstr:
+            #Replace the comma with a 'full-stop'
+            durationstr = durationstr.replace(',', '.')
+
+        return float(durationstr[durationstartindex:durationendindex])
+    #durationstr can be of the form PnYnMnDTnHnMnS or PnW
+
+    #Make sure only the lowest order element has decimal precision
+    if durationstr.count('.') > 1:
+        raise ValueError('String is not a valid ISO8601 duration.')
+    elif durationstr.count('.') == 1:
+        #There should only ever be 1 letter after a decimal if there is more
+        #then one, the string is invalid
+        lettercount = 0;
+
+        for character in durationstr.split('.')[1]:
+            if character.isalpha() == True:
+                lettercount += 1
+
+            if lettercount > 1:
+                raise ValueError('String is not a valid ISO8601 duration.')
+
+    #Parse the elements of the duration
+    if durationstr.find('T') == -1:
+        if durationstr.find('Y') != -1:
+            years = parse_duration_element(durationstr, 'Y')
+        else:
+            years = 0
+
+        if durationstr.find('M') != -1:
+            months = parse_duration_element(durationstr, 'M')
+        else:
+            months = 0
+
+        if durationstr.find('W') != -1:
+            weeks = parse_duration_element(durationstr, 'W')
+        else:
+            weeks = 0
+
+        if durationstr.find('D') != -1:
+            days = parse_duration_element(durationstr, 'D')
+        else:
+            days = 0
+
+        #No hours, minutes or seconds
+        hours = 0
+        minutes = 0
+        seconds = 0
+    else:
+        firsthalf = durationstr[:durationstr.find('T')]
+        secondhalf = durationstr[durationstr.find('T'):]
+
+        if  firsthalf.find('Y') != -1:
+            years = parse_duration_element(firsthalf, 'Y')
+        else:
+            years = 0
+
+        if firsthalf.find('M') != -1:
+            months = parse_duration_element(firsthalf, 'M')
+        else:
+            months = 0
+
+        if durationstr.find('W') != -1:
+            weeks = parse_duration_element(durationstr, 'W')
+        else:
+            weeks = 0
+
+        if firsthalf.find('D') != -1:
+            days = parse_duration_element(firsthalf, 'D')
+        else:
+            days = 0
+
+        if secondhalf.find('H') != -1:
+            hours = parse_duration_element(secondhalf, 'H')
+        else:
+            hours = 0
+
+        if secondhalf.find('M') != -1:
+            minutes = parse_duration_element(secondhalf, 'M')
+        else:
+            minutes = 0
+
+        if secondhalf.find('S') != -1:
+            seconds = parse_duration_element(secondhalf, 'S')
+        else:
+            seconds = 0
+
+    #Note that weeks can be handled without conversion to days
+    totaldays = years * 365 + months * 30 + days
+
+    return int(timedelta(
+        weeks=weeks,
+        days=totaldays,
+        hours=hours,
+        minutes=minutes,
+        seconds=seconds
+    ).total_seconds())
